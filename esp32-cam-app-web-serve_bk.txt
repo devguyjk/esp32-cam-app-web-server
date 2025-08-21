@@ -1,0 +1,333 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <mbedtls/md5.h> // Include MD5 library
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h> // For mDNS discovery
+#include <WiFiClientSecure.h>
+
+// Your camera model definition
+#define CAMERA_MODEL_AI_THINKER // Has PSRAM
+#define LED_FLASH_PIN 4 // GPIO pin connected to the LED (check your board)
+#include "camera_pins.h"
+
+// Forward declarations for web server handlers and helper functions
+void handleCapture();
+void handleRoot();
+void updateDuckDNS();
+void setupLedFlash(int pin);
+String generateShortUniqueId();
+void handleHello();
+void handleStream();
+void handleSetBW();
+
+
+// ===========================
+// Enter your WiFi credentials
+// ===========================
+const char *ssid = "juke-fiber-ofc";
+const char *password = "swiftbubble01";
+const char* duckdnsToken = "e9d4cdfd-9753-4555-a03e-e6f46a637023"; // Your DuckDNS token
+
+WebServer server(80); // Web server on port 80
+
+void handleCapture() {
+  Serial.println("Handling capture endpoint...");
+
+  digitalWrite(LED_FLASH_PIN, HIGH); // Turn flash ON
+  delay(200); // Keep flash on for 200ms (adjust as needed)
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    digitalWrite(LED_FLASH_PIN, LOW); // Turn flash OFF (even if error)
+    server.send(500, "text/plain", "Camera frame buffer failed");
+    return;
+  }
+
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+
+  digitalWrite(LED_FLASH_PIN, LOW); // Turn flash OFF
+
+  Serial.println("Snapshot sent via /capture!");
+}
+
+void handleRoot() {
+  String htmlContent = "<h1>ESP32 Camera</h1>";
+  htmlContent += "<p><a href='/capture'>Capture Image</a></p>";
+  htmlContent += "<p><a href='/hello'>Go to Stream</a></p>"; // Added link to your new /hello page
+  server.send(200, "text/html", htmlContent);
+}
+
+
+void updateDuckDNS() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String serverPath = "https://www.duckdns.org/update?domains=" + generateShortUniqueId() + "&token=" + String(duckdnsToken) + "&ip=" + WiFi.localIP().toString();
+    http.begin(serverPath.c_str());
+
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode > 0) {
+      Serial.print("HTTP Response code: ");
+      Serial.print("Success updating dns for the cam:" + serverPath);
+      Serial.println(httpResponseCode);
+    } else {
+      Serial.print("Error updating duckdns, code: ");
+      Serial.println(httpResponseCode);
+    }
+    http.end();
+  }
+}
+
+void setupLedFlash(int pin) {
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW); // Initialize LED as off
+}
+
+// Ensure generateShortUniqueId is defined before setup if not forward declared
+String generateShortUniqueId() {
+  // Get Chip ID
+  uint64_t chipId = ESP.getEfuseMac();
+
+  // Create input data for MD5 hash
+  uint8_t inputData[8];
+  memcpy(inputData, &chipId, 8); // Copy chip ID into byte array
+
+  // Calculate MD5 hash
+  uint8_t md5Hash[16];
+  mbedtls_md5(inputData, 8, md5Hash);
+
+  // Convert hash to hexadecimal string
+  char md5String[33]; // 16 bytes * 2 hex chars + null terminator
+  for (int i = 0; i < 16; i++) {
+    sprintf(md5String + (i * 2), "%02x", md5Hash[i]);
+  }
+
+  // Return the first 8 characters of the MD5 hash
+  return String(md5String).substring(0, 8);
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  Serial.println();
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.frame_size = FRAMESIZE_UXGA;
+  config.pixel_format = PIXFORMAT_JPEG;    // for single capture
+  //config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+
+  // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
+  //           for larger pre-allocated frame buffer.
+  if (config.pixel_format == PIXFORMAT_JPEG) {
+    if (psramFound()) {
+      config.jpeg_quality = 10;
+      config.fb_count = 2;
+      config.grab_mode = CAMERA_GRAB_LATEST;
+    } else {
+      // Limit the frame size when PSRAM is not available
+      config.frame_size = FRAMESIZE_SVGA;
+      config.fb_location = CAMERA_FB_IN_DRAM;
+    }
+  } else {
+    // Best option for face detection/recognition
+    config.frame_size = FRAMESIZE_240X240;
+#if CONFIG_IDF_TARGET_ESP32S3
+    config.fb_count = 2;
+#endif
+  }
+
+#if defined(CAMERA_MODEL_ESP_EYE)
+  pinMode(13, INPUT_PULLUP);
+  pinMode(14, INPUT_PULLUP);
+#endif
+
+  // camera init
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  // initial sensors are flipped vertically and colors are a bit saturated
+  if (s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);       // flip it back
+    s->set_brightness(s, 1);  // up the brightness just a bit
+    s->set_saturation(s, -2); // lower the saturation
+  }
+  // drop down frame size for higher initial frame rate
+  if (config.pixel_format == PIXFORMAT_JPEG) {
+    s->set_framesize(s, FRAMESIZE_HD);
+  }
+
+#if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
+  s->set_vflip(s, 1);
+  s->set_hmirror(s, 1);
+#endif
+
+#if defined(CAMERA_MODEL_ESP32S3_EYE)
+  s->set_vflip(s, 1);
+#endif
+
+// Setup LED FLash if LED pin is defined in camera_pins.h
+#if defined(LED_GPIO_NUM)
+  setupLedFlash(LED_GPIO_NUM);
+#endif
+
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+
+  Serial.print("WiFi connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+  Serial.println("UniqueID: " + generateShortUniqueId());
+
+  // Initialize mDNS
+  if (!MDNS.begin(generateShortUniqueId().c_str())) {
+    Serial.println("Error setting up mDNS responder!");
+  } else {
+    Serial.println("mDNS responder started");
+    // Add service to mDNS
+    MDNS.addService("http", "tcp", 80);
+  }
+
+  // Define the /set_bw endpoint
+  server.on("/set_bw", HTTP_GET, handleSetBW);
+  // Define the /capture endpoint
+  server.on("/capture", HTTP_GET, handleCapture);
+  // Define Hello route
+  server.on("/hello", HTTP_GET, handleHello); // Ensure this is uncommented
+  // Define stream
+  server.on("/stream", HTTP_GET, handleStream); // Ensure this is uncommented
+
+  // Define the root endpoint for a simple UI
+  server.on("/", HTTP_GET, handleRoot);
+
+  // Start the web server
+  server.begin();
+  Serial.println("Web server started");
+
+  updateDuckDNS();
+}
+
+void loop() {
+  server.handleClient();
+  delay(10); // Small delay to keep the ESP32 responsive
+}
+
+
+void handleHello() {
+  String html = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>ESP32 Cam Stream</title>
+      <style>
+        body { font-family: sans-serif; text-align: center; margin-top: 30px; }
+        .video-container { display: flex; justify-content: center; margin-bottom: 20px; }
+        .controls { margin-top: 20px; }
+        input[type=radio] { margin: 0 5px; }
+      </style>
+    </head>
+    <body>
+      <h1>ESP32 Camera Stream</h1>
+      <div class="video-container">
+        <img src="/stream" style="width:90%; max-width: 480px; border:1px solid #ccc; border-radius: 8px;">
+      </div>
+      <div class="controls">
+        <label><input type="radio" name="mode" value="color" onchange="setMode(this.value)" checked> Color</label>
+        <label><input type="radio" name="mode" value="bw" onchange="setMode(this.value)"> Black & White</label>
+      </div>
+
+      <script>
+        function setMode(mode) {
+          fetch("/set_bw?mode=" + mode)
+            .then(resp => resp.text())
+            .then(data => console.log(data))
+            .catch(err => console.error("Error setting mode:", err));
+        }
+      </script>
+    </body>
+    </html>
+  )rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+
+void handleStream() {
+  WiFiClient client = server.client();
+
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  client.print(response);
+
+  while (client.connected()) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      continue;
+    }
+
+    client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+    client.write(fb->buf, fb->len);
+    client.print("\r\n");
+
+    esp_camera_fb_return(fb);
+
+    delay(100); // Adjust for desired frame rate (e.g. 10fps)
+  }
+}
+
+void handleSetBW() {
+  if (!server.hasArg("mode")) {
+    server.send(400, "text/plain", "Missing 'mode' parameter");
+    return;
+  }
+
+  String mode = server.arg("mode");
+  sensor_t *s = esp_camera_sensor_get();
+
+  if (mode == "bw") {
+    s->set_special_effect(s, 2); // Grayscale
+  } else if (mode == "color") {
+    s->set_special_effect(s, 0); // Normal color
+  } else {
+    server.send(400, "text/plain", "Invalid mode. Use 'bw' or 'color'.");
+    return;
+  }
+
+  server.send(200, "text/plain", "Mode set to " + mode);
+}
